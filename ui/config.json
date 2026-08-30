@@ -1,0 +1,12 @@
+{
+  "models": {
+    "base": "models/evoke-base",
+    "transformer": "models/evoke/stage3_post_distillation",
+    "vigeo": "models/ViGeo1.1",
+    "da3": "models/DA3"
+  },
+  "geometry": {
+    "preloadViGeo": true,
+    "warmup": true
+  }
+}

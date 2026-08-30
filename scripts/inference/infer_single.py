@@ -745,6 +745,13 @@ _PER_CASE_ARGS = frozenset({
     "segment_prompts_path", "start_seconds", "case_name", "seed",
     "prompt_schedule", "ref_video_for_viz",
     "lingbot_pose_source_fps", "lingbot_pose_source_resolution",
+    # i2v and v2v share identical weights/pipeline construction. These only select
+    # and prepare per-call conditioning; keeping them in the cache key made the
+    # persistent UI re-read 54 GB of weights on the first director-mode branch.
+    "sample_type", "ref_seconds",
+    "image_noise_sigma_min", "image_noise_sigma_max",
+    "video_noise_sigma_min", "video_noise_sigma_max",
+    "geo_vigeo_scale_mode",
 })
 
 
@@ -1106,7 +1113,29 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"[geo-infer] output:  {output_dir}", flush=True)
 
+    progress_path = output_dir / "progress.json"
+    progress_chunks = max(1, (int(args.num_frames) + 32) // 33)
+
+    def _write_progress(*, phase: str, chunks: int = progress_chunks, chunk_index: int = 0,
+                        stage: int = 0, step: int = 0, total_steps: int = 0, **_unused) -> None:
+        payload = {
+            "phase": phase,
+            "chunks": int(chunks),
+            "chunkIndex": int(chunk_index),
+            "stage": int(stage),
+            "step": int(step),
+            "totalSteps": int(total_steps),
+            "updatedAt": time.time(),
+        }
+        temporary = progress_path.with_suffix(f".json.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+        temporary.replace(progress_path)
+
+    _write_progress(phase="preparing")
+
     pipe, transformer, vae, device = build_pipe(args)
+    pipe._evoke_progress_callback = _write_progress
+    pipe._evoke_offload_text_encoder = True
 
     # `seed` is a per-case arg (see _PER_CASE_ARGS), so a cached pipeline still carries the seed of
     #   whichever case built it. Only one field is affected -- the patch-drop generator, which is inert
@@ -1115,6 +1144,11 @@ def main(argv=None):
     #   Generator below) is created per call.
     if getattr(pipe, "_geo_vsnoise_cfg", None) is not None:
         pipe._geo_vsnoise_cfg["warp_patch_drop_seed"] = int(args.seed)
+        # ``auto`` resolves to depth_median for i2v and anchor for v2v. It is a
+        # rollout policy consumed by the fresh per-call FrameBank, not a weight
+        # construction setting, so switching Director modes must not rebuild the
+        # 54 GB transformer.
+        pipe._geo_vsnoise_cfg["vigeo_scale_mode"] = str(args.geo_vigeo_scale_mode)
 
     # enable GEO intermediate dumps if requested (pipeline reads _geo_dump_dir attr)
     if args.dump_geo_intermediates:
@@ -1557,6 +1591,9 @@ def main(argv=None):
         pipe_kwargs["lingbot_c2ws"] = lingbot_c2ws
         pipe_kwargs["lingbot_Ks"] = lingbot_Ks
 
+    # The persistent worker parks the text encoder on CPU between requests and after prompt encoding;
+    # bring it back only for the short embedding phase. This frees several GiB before ViGeo/VAE peak.
+    pipe.text_encoder.to(device)
     out = pipe(**pipe_kwargs)
 
     elapsed = time.time() - t0
@@ -1763,9 +1800,142 @@ def run_argv_batch(path: str) -> int:
     return 1 if failed else 0
 
 
+def run_argv_server(template_path: str, queue_path: str) -> int:
+    """Keep one cached pipeline alive and execute file-queued argv jobs serially.
+
+    ``template_path`` contains one batch-style JSON object whose argv defines the setup-affecting
+    model recipe. The template is parsed and loaded immediately, but is never generated. Producers
+    atomically place one JSON object per request under ``queue_path/requests``; this worker writes a
+    matching response under ``queue_path/responses``. Per-request stdout/stderr still goes to the
+    ``log`` path carried by the request, matching ``run_argv_batch``.
+    """
+    import contextlib
+    import gc
+    import traceback
+
+    queue = Path(queue_path)
+    requests = queue / "requests"
+    responses = queue / "responses"
+    requests.mkdir(parents=True, exist_ok=True)
+    responses.mkdir(parents=True, exist_ok=True)
+    state_path = queue / "state.json"
+
+    def write_json(path: Path, payload: dict) -> None:
+        temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+    def set_state(phase: str, message: str, request_id: str | None = None) -> None:
+        write_json(state_path, {
+            "phase": phase,
+            "message": message,
+            "requestId": request_id,
+            "pid": os.getpid(),
+            "updatedAt": time.time(),
+        })
+
+    try:
+        template = json.loads(Path(template_path).read_text(encoding="utf-8"))
+        template_args = parse_args(template["argv"])
+        _check_prereqs(template_args)
+        set_state("loading", "正在预加载 Post-distill 管线")
+        pipe, _, _, _ = build_pipe(template_args)
+        pipe._evoke_offload_text_encoder = True
+        pipe.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+    except BaseException as error:
+        set_state("error", f"预加载失败: {type(error).__name__}: {error}")
+        traceback.print_exc()
+        return 1
+
+    set_state("ready", "Post-distill 管线已加载并常驻 GPU")
+    print(f"[geo-infer] argv server READY pid={os.getpid()} queue={queue}", flush=True)
+    while True:
+        pending = sorted(requests.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        if not pending:
+            time.sleep(0.25)
+            continue
+        request_path = pending[0]
+        request_id = request_path.stem
+        claimed = queue / f"running-{request_id}.json"
+        try:
+            request_path.replace(claimed)
+        except FileNotFoundError:
+            continue
+        started = time.time()
+        rc = 0
+        error_text = None
+        log = None
+        cached_pipe = next(iter(_PIPE_CACHE.values()))[0] if _PIPE_CACHE else None
+        original_decode = (
+            cached_pipe._decode_chunk_persistent_cache if cached_pipe is not None else None
+        )
+        try:
+            job = json.loads(claimed.read_text(encoding="utf-8"))
+            argv, log = job["argv"], job.get("log")
+            set_state("running", f"正在生成任务 {request_id}", request_id)
+            if log:
+                Path(log).parent.mkdir(parents=True, exist_ok=True)
+                log_file = open(log, "w", encoding="utf-8")
+                stack = contextlib.ExitStack()
+                stack.enter_context(log_file)
+                stack.enter_context(contextlib.redirect_stdout(log_file))
+                stack.enter_context(contextlib.redirect_stderr(log_file))
+            else:
+                stack = contextlib.nullcontext()
+            with stack:
+                try:
+                    main(argv)
+                except SystemExit as error:
+                    if error.code not in (0, None):
+                        raise RuntimeError(f"SystemExit({error.code})")
+        except BaseException as error:
+            rc = 1
+            error_text = f"{type(error).__name__}: {error}"
+            if log:
+                with open(log, "a", encoding="utf-8") as log_file:
+                    traceback.print_exc(file=log_file)
+            else:
+                traceback.print_exc()
+        finally:
+            # save_chunk_segments installs a per-case closure on the shared pipe. Restore the method
+            # before accepting another request so chunk indices, output paths and reference frames
+            # cannot leak across jobs. Also clear causal VAE/KV state when an exception bypassed the
+            # normal end-of-rollout cleanup (notably CUDA OOM during decode).
+            if cached_pipe is not None:
+                if original_decode is not None:
+                    cached_pipe._decode_chunk_persistent_cache = original_decode
+                try:
+                    cached_pipe.vae.clear_cache()
+                except Exception:
+                    pass
+                try:
+                    cached_pipe.transformer.clear_kv_cache()
+                except Exception:
+                    pass
+                cached_pipe._current_timestep = None
+                cached_pipe._evoke_progress_callback = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            response = {
+                "requestId": request_id,
+                "returnCode": rc,
+                "error": error_text,
+                "elapsed": time.time() - started,
+            }
+            write_json(responses / f"{request_id}.json", response)
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+            set_state("ready", "Post-distill 管线已加载并常驻 GPU")
+
+
 if __name__ == "__main__":
     # --argv_jsonl is dispatched here rather than through argparse: its payload is a list of argv
     # lists for main(), so it cannot share a command line with the per-case flags.
     if len(sys.argv) == 3 and sys.argv[1] == "--argv_jsonl":
         sys.exit(run_argv_batch(sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[1] == "--argv_server":
+        sys.exit(run_argv_server(sys.argv[2], sys.argv[3]))
     main()

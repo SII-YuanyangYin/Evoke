@@ -40,6 +40,15 @@
   linear-attention global state make its memory and compute grow **linearly** — which is what makes
   30 s self-forced supervision affordable.
 
+## 📰 Latest News
+
+- **2026-08-30 — Director Web UI.** EVOKE now ships with a local Web UI for per-chunk prompting,
+  dual-stick camera control, streaming previews, continuation, and revision branching. See the
+  [UI guide and interface preview](ui/README.md).
+- **2026-08-14 — Day 0.** Alaya-EVOKE entered the official
+  [WBench](https://github.com/meituan-longcat/WBench) table and achieved state of the art in its
+  release snapshot, one day after the [first arXiv submission](https://arxiv.org/abs/2608.13546).
+
 ## 🎬 Demos
 
 <p align="center">
@@ -179,6 +188,28 @@ speed knob — training and inference must agree on it.
 > Both depth backends ship under **CC-BY-NC-4.0**, which is more restrictive than this repo's
 > Apache-2.0. Check their licences before any commercial use.
 
+## 🖥️ Director Web UI
+
+The repository includes a local, single-GPU Director UI for the released post-distill model. It
+supports a reference image, per-chunk prompts, independent movement/look camera controls, streaming
+chunk previews, lazy full-video download, continuation, and non-destructive revision branching. The
+bundled default is the six-chunk Meteor case.
+
+Complete the Environment and Weights sections above first, make sure `ffmpeg` is on `PATH`, then run
+from the repository root:
+
+```bash
+python -m pip install -r ui/requirements.txt
+python ui/app.py
+```
+
+Open <http://127.0.0.1:7860> and wait for the status to become `READY`. Generated projects, jobs,
+videos, logs, and caches are excluded from source releases by `ui/.gitignore`.
+
+The server binds to localhost by default and does not provide authentication or rate limiting. Do
+not expose it directly to the public internet. Configuration, model-path overrides, data layout,
+and the deliberately exposed reverse-proxy form are documented in **[`ui/README.md`](ui/README.md)**.
+
 ## 🚀 Inference
 
 **384 × 640 @ 24 fps.** One chunk = 36 frames = 1.5 s, so `NUM_CHUNKS=20` is a 30 s clip. All four
@@ -246,7 +277,9 @@ swallows it).
 
 The EVOKE teacher is built on **[LingBot-World](https://github.com/robbyant/lingbot-world)**. The
 vae / text encoder / tokenizer / scheduler in `models/evoke-base` come from the released
-**[Helios](https://github.com/PKU-YuanGroup/Helios)** base, which traces them to **Wan**.
+**[Helios](https://github.com/PKU-YuanGroup/Helios)** base, which traces them to **Wan**. The optional
+Director UI LightTAE decoder adapter is adapted from
+**[ModelTC/LightX2V](https://github.com/ModelTC/LightX2V)** under Apache-2.0.
 
 ## 🔒 License
 

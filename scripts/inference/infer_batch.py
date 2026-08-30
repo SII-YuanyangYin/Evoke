@@ -10,7 +10,7 @@ for each case it shells out to
 Each launcher mirrors the knobs of its training config. A warp/attention mismatch between
 training and inference degrades quality, so a new model means updating its launcher.
 Sharding: SHARD / NSHARD env vars, case i goes to shard i % NSHARD; MAX_CASES>0 keeps the first N."""
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]   # scripts/inference/ → repo root
@@ -134,6 +134,13 @@ AMPLIFY_FIRST_CHUNK = _env("AMPLIFY_FIRST_CHUNK", "0")
 #   cross-case state leak). Measured on this ckpt: per-case wall time 251 s with per-case processes,
 #   of which ~131 s was rebuilding the pipeline -- identical work for every case in the shard.
 IN_PROCESS_BATCH = _env("IN_PROCESS_BATCH", "1")
+# Optional file-queue transport used by the Director UI. A preload launcher starts one
+# infer_single --argv_server process and blocks there; later launchers only translate their JSONL
+# rows into argv and submit them to that already-loaded process. Empty keeps the regular CLI/batch
+# behaviour unchanged.
+ARGV_SERVER_DIR = _env("EVOKE_ARGV_SERVER_DIR", "")
+SERVER_PRELOAD = _env("EVOKE_SERVER_PRELOAD", "0") == "1"
+SERVER_REQUEST_ID = _env("EVOKE_SERVER_REQUEST_ID", "")
 # Debug artefacts. Both default on (they are how a bad case gets diagnosed), but they are pure
 #   overhead for a large sweep: per 5-chunk case DUMP_GEO writes 2 mp4s per chunk (~8 MB) and
 #   SAVE_SEGMENTS one more per chunk (~5 MB), and the encoding is on the critical path -- of a
@@ -567,8 +574,6 @@ def main():
     if IN_PROCESS_BATCH == "1" and pending:
         batch_file = OUT_ROOT / f"_argv_batch_shard{SHARD}.jsonl"
         batch_file.write_text("".join(json.dumps(j, ensure_ascii=False) + "\n" for j in pending))
-        print(f"\n==== [shard {SHARD}] {len(pending)} case(s) in ONE process "
-              f"[{TRANSFORMER_PATH}] ====\n     argv batch: {batch_file}", flush=True)
         env = dict(os.environ); env["PYTHONPATH"] = f"{REPO}:{env.get('PYTHONPATH','')}"
         env["EVOKE_INFER_PROGRESS"] = "1" if VERBOSE else "0"
         env["DA3_LOG_LEVEL"] = os.environ.get(
@@ -578,18 +583,83 @@ def main():
         #   work (VAE decode post-processing, PNG deflate, mp4 encode) that dominates the non-diffusion
         #   half of a case. Give each shard its fair share instead. Only set when the caller has not,
         #   so an explicit OMP_NUM_THREADS still wins.
-        _share = max(1, (os.cpu_count() or 8) // max(1, NSHARD))
+        # numexpr hard-caps its pool at 64; advertising the host's full 192 cores makes it reject the
+        # setting at first job import and prints a misleading error into the persistent-worker log.
+        _share = min(64, max(1, (os.cpu_count() or 8) // max(1, NSHARD)))
         for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "CV_NUM_THREADS"):
             env.setdefault(_v, str(_share))
         env.setdefault("EVOKE_CPU_THREADS", str(_share))
         shard_log = OUT_ROOT / "_logs" / f"_shard{SHARD}_batch.log"
-        # The child prints one progress line per case (the engine's own output goes to the per-case
-        #   logs it redirects to), so a plain tee is enough here -- no \r bar to preserve.
-        with open(shard_log, "w") as lg:
-            rc_batch = subprocess.run(
-                [sys.executable, "scripts/inference/infer_single.py", "--argv_jsonl", str(batch_file)],
-                env=env, stdout=lg, stderr=subprocess.STDOUT).returncode
+        if ARGV_SERVER_DIR:
+            server_dir = Path(ARGV_SERVER_DIR).resolve()
+            requests_dir = server_dir / "requests"
+            responses_dir = server_dir / "responses"
+            requests_dir.mkdir(parents=True, exist_ok=True)
+            responses_dir.mkdir(parents=True, exist_ok=True)
+            state_path = server_dir / "state.json"
+
+            def _atomic_json(path: Path, payload: dict) -> None:
+                temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+                temporary.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+                temporary.replace(path)
+
+            if SERVER_PRELOAD:
+                template_path = server_dir / "template.json"
+                _atomic_json(template_path, pending[0])
+                print(f"\n==== [shard {SHARD}] PRELOADING persistent pipeline "
+                      f"[{TRANSFORMER_PATH}] ====\n     queue: {server_dir}", flush=True)
+                # This deliberately never returns during normal operation: the UI owns this launcher
+                # as its long-lived GPU worker and terminates the process group on shutdown.
+                rc_batch = subprocess.run(
+                    [sys.executable, "scripts/inference/infer_single.py", "--argv_server",
+                     str(template_path), str(server_dir)],
+                    env=env).returncode
+            else:
+                if len(pending) != 1:
+                    sys.exit("[ERROR] EVOKE argv server submissions must contain exactly one case")
+                request_id = SERVER_REQUEST_ID or f"shard{SHARD}-{os.getpid()}-{int(time.time() * 1000)}"
+                request_path = requests_dir / f"{request_id}.json"
+                response_path = responses_dir / f"{request_id}.json"
+                response_path.unlink(missing_ok=True)
+                _atomic_json(request_path, pending[0])
+                print(f"\n==== [shard {SHARD}] submitted {pending[0]['name']} to persistent worker "
+                      f"request={request_id} ====", flush=True)
+                last_notice = 0.0
+                while not response_path.is_file():
+                    now = time.time()
+                    if now - last_notice >= 10:
+                        phase = "starting"
+                        worker_pid = None
+                        try:
+                            state = json.loads(state_path.read_text(encoding="utf-8"))
+                            phase = state.get("phase", phase)
+                            worker_pid = state.get("pid")
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                        if worker_pid:
+                            try:
+                                os.kill(int(worker_pid), 0)
+                            except (ProcessLookupError, ValueError):
+                                sys.exit(f"[ERROR] persistent worker exited while request {request_id} was pending")
+                            except PermissionError:
+                                pass
+                        print(f"[worker] request={request_id} phase={phase}", flush=True)
+                        last_notice = now
+                    time.sleep(0.5)
+                response = json.loads(response_path.read_text(encoding="utf-8"))
+                rc_batch = int(response.get("returnCode", 1))
+                print(f"[worker] request={request_id} finished rc={rc_batch} "
+                      f"elapsed={float(response.get('elapsed', 0)):.1f}s", flush=True)
+        else:
+            print(f"\n==== [shard {SHARD}] {len(pending)} case(s) in ONE process "
+                  f"[{TRANSFORMER_PATH}] ====\n     argv batch: {batch_file}", flush=True)
+            # The child prints one progress line per case (the engine's own output goes to the per-case
+            # logs it redirects to), so a plain tee is enough here -- no \r bar to preserve.
+            with open(shard_log, "w") as lg:
+                rc_batch = subprocess.run(
+                    [sys.executable, "scripts/inference/infer_single.py", "--argv_jsonl", str(batch_file)],
+                    env=env, stdout=lg, stderr=subprocess.STDOUT).returncode
         # With BG_POSTPROC the child returns before its detached workers have written DONE_MARK, so the
         #   bookkeeping below would mark good cases FAIL and rmdir their (still-being-filled) output.
         if BG_POSTPROC == "1":

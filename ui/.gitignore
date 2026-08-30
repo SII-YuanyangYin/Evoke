@@ -1,0 +1,33 @@
+# Release allowlist: ignore everything in ui/ unless it is required to run the
+# published Director UI. This keeps local jobs, generated videos, logs, caches,
+# editor files, downloaded weights, and ad-hoc experiments out of a release.
+/*
+
+# Documentation and configuration.
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/config.json
+
+# Documentation assets.
+!/assets/
+/assets/*
+!/assets/director-ui.png
+
+# Backend runtime.
+!/app.py
+!/trajectory.py
+!/lighttae_decoder.py
+!/runtime/
+/runtime/*
+!/runtime/lighttae_hook.py
+!/runtime/sitecustomize.py
+!/runtime/vigeo_hook.py
+
+# Browser application.
+!/static/
+/static/*
+!/static/app.js
+!/static/index.html
+!/static/logo.png
+!/static/styles.css

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b0d0c" />
+    <title>EVOKE Director · 流式世界生成</title>
+    <link rel="stylesheet" href="static/styles.css?v=17" />
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="EVOKE Director home">
+        <span class="brand-mark" aria-hidden="true"><img src="static/logo.png" alt="" /></span>
+        <span>EVOKE <b>DIRECTOR</b></span>
+      </a>
+      <div class="topbar-center">
+        <span class="live-dot"></span>
+        <span id="weightStatus">检查本地权重…</span>
+      </div>
+      <div class="topbar-meta">
+        <button id="defaultCaseButton" type="button">恢复默认 CASE</button>
+        <span>POST-DISTILL</span>
+        <span>384 × 640</span>
+        <span>24 FPS</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="hero">
+        <div>
+          <div class="eyebrow">CAMERA-CONTROLLED WORLD STREAM</div>
+          <h1>从一帧开始，<br /><em>导演接下来的世界。</em></h1>
+        </div>
+        <p>一条连续运镜轨迹，一组逐段叙事指令。EVOKE 将每个 chunk 生成为 1.5 秒视频，并在完成后立即送入预览流。</p>
+      </section>
+
+      <div class="stage-grid">
+        <section class="panel input-panel">
+          <div class="panel-heading">
+            <div><span class="step">01</span><h2>起始画面</h2></div>
+            <span class="hint">REF IMAGE</span>
+          </div>
+          <label class="drop-zone" id="dropZone" for="referenceInput">
+            <input id="referenceInput" type="file" accept="image/png,image/jpeg,image/webp" />
+            <img id="referencePreview" alt="参考图预览" style="object-fit: contain; object-position: center; background: #070908" />
+            <div class="drop-empty" id="dropEmpty">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 13v6h14v-6" /></svg>
+              <strong>拖入一张参考图</strong>
+              <span>PNG / JPG / WEBP · 输出画布 640 × 384（5:3）</span>
+            </div>
+            <button class="replace-image" id="replaceImage" type="button">更换图片</button>
+          </label>
+
+          <div class="panel-heading camera-heading">
+            <div><span class="step">02</span><h2>双摇杆运镜</h2></div>
+            <span class="hint">MOVE + LOOK · <b id="coverageDuration">6.0S</b></span>
+          </div>
+          <div class="joystick-grid">
+            <div class="joystick-column">
+              <div class="joystick-title"><strong>移动</strong><span>左摇杆 · 前后左右</span></div>
+              <div class="trajectory-shell">
+                <div class="trajectory-toolbar" role="group" aria-label="移动预设">
+                  <button class="preset active" data-preset="push" type="button">前进</button>
+                  <button class="preset" data-preset="orbit" type="button">环绕</button>
+                  <button class="preset" data-preset="truck" type="button">横移</button>
+                  <button class="preset" data-preset="static" type="button">固定</button>
+                  <button class="icon-button" id="clearPath" type="button" title="自由绘制移动" aria-label="自由绘制移动">
+                    <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" /></svg>
+                  </button>
+                </div>
+                <canvas id="trajectoryCanvas" aria-label="俯视移动轨迹绘制区域"></canvas>
+                <span class="axis-label axis-up">前</span><span class="axis-label axis-down">后</span>
+                <span class="axis-label axis-left">左</span><span class="axis-label axis-right">右</span>
+                <div class="draw-help" id="moveDrawHelp">拖动绘制移动轨迹</div>
+              </div>
+            </div>
+            <div class="joystick-column">
+              <div class="joystick-title"><strong>视角</strong><span>右摇杆 · 转头与俯仰</span></div>
+              <div class="trajectory-shell look-shell">
+                <div class="trajectory-toolbar" role="group" aria-label="视角预设">
+                  <button class="look-preset active" data-look-preset="center" type="button">正视</button>
+                  <button class="look-preset" data-look-preset="left" type="button">左看</button>
+                  <button class="look-preset" data-look-preset="right" type="button">右看</button>
+                  <button class="look-preset" data-look-preset="up" type="button">仰头</button>
+                  <button class="look-preset" data-look-preset="down" type="button">低头</button>
+                  <button class="icon-button" id="clearLook" type="button" title="重置视角" aria-label="重置视角">
+                    <svg viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15" /></svg>
+                  </button>
+                </div>
+                <canvas id="lookCanvas" aria-label="镜头方向轨迹绘制区域"></canvas>
+                <span class="axis-label axis-up">仰</span><span class="axis-label axis-down">俯</span>
+                <span class="axis-label axis-left">左转</span><span class="axis-label axis-right">右转</span>
+                <div class="draw-help" id="lookDrawHelp">从中心拖动视角轨迹</div>
+              </div>
+            </div>
+          </div>
+          <div class="camera-controls">
+            <label>
+              <span>整体幅度 <output id="motionScaleValue">100%</output></span>
+              <input id="motionScale" type="range" min="0" max="48" step="1" value="24" />
+            </label>
+            <label>
+              <span>位置升降 <output id="verticalLiftValue">0</output></span>
+              <input id="verticalLift" type="range" min="-10" max="10" step="1" value="0" />
+            </label>
+            <label>
+              <span>视场角 <output id="fovValue">70°</output></span>
+              <input id="fov" type="range" min="35" max="100" step="1" value="70" />
+            </label>
+            <label class="toggle-row">
+              <span>移动方向辅助转向</span>
+              <input id="followPath" type="checkbox" />
+              <i aria-hidden="true"></i>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel timeline-panel">
+          <div class="panel-heading timeline-heading">
+            <div><span class="step">03</span><h2>Chunk 剧本</h2></div>
+            <div class="chunk-counter">
+              <button id="decreaseChunks" type="button" aria-label="减少 chunk">−</button>
+              <strong id="chunkCount">4</strong>
+              <button id="increaseChunks" type="button" aria-label="增加 chunk">+</button>
+              <span>CHUNKS</span>
+            </div>
+          </div>
+          <div class="duration-strip">
+            <div>
+              <span>总时长</span><strong id="totalDuration">6.0 秒</strong>
+            </div>
+            <div>
+              <span>输出帧</span><strong id="frameCount">141</strong>
+            </div>
+            <div>
+              <span>采样</span><strong>3 STEP · CFG FREE</strong>
+            </div>
+          </div>
+          <div class="timeline-ruler" id="timelineRuler"></div>
+          <div class="prompt-list" id="promptList"></div>
+          <div class="timeline-actions">
+            <button class="text-button" id="fillPrompts" type="button">将首段描述填入空白段</button>
+            <span>每段 prompt 在起始处切换，不中断世界状态。</span>
+          </div>
+        </section>
+
+        <aside class="panel output-panel">
+          <div class="panel-heading">
+            <div><span class="step">04</span><h2>生成流</h2></div>
+            <span class="status-pill idle" id="jobStatus">READY</span>
+          </div>
+          <div class="runtime-checks" aria-label="运行环境状态">
+            <div class="runtime-check" id="gpuCheck">
+              <span>CUDA / GPU</span>
+              <strong id="gpuStatus">检测中…</strong>
+              <small id="gpuDetail">读取显卡配置</small>
+            </div>
+            <div class="runtime-check" id="modelCheck">
+              <span>模型权重</span>
+              <strong id="modelStatus">检测中…</strong>
+              <small id="modelDetail">POST · BASE · VIGEO</small>
+            </div>
+            <div class="runtime-check" id="runtimeCheck">
+              <span>运行管线</span>
+              <strong id="runtimeStatus">IDLE</strong>
+              <small id="runtimeDetail">等待生成任务</small>
+            </div>
+          </div>
+          <div class="monitor" id="monitor">
+            <div class="monitor-grid"></div>
+            <div class="monitor-empty" id="monitorEmpty">
+              <div class="aperture"><i></i><i></i><i></i></div>
+              <strong>等待开始生成</strong>
+              <span>完成的 chunk 将在这里逐段出现</span>
+            </div>
+            <video id="finalVideo" controls controlslist="nodownload" playsinline muted preload="auto"></video>
+            <video id="playlistBuffer" playsinline muted preload="auto" aria-hidden="true"></video>
+            <details class="full-download-menu" id="fullDownloadMenu" hidden>
+              <summary aria-label="完整视频菜单" title="完整视频菜单">⋮</summary>
+              <div><a id="downloadFullAction" href="#" download>下载完整视频</a></div>
+            </details>
+          </div>
+          <div class="progress-block">
+            <div class="progress-copy">
+              <span id="progressMessage">配置画面、剧本和轨迹</span>
+              <strong id="progressFraction">0 / 4</strong>
+            </div>
+            <div class="phase-strip" id="phaseStrip">
+              <span data-phase="geometry">GEO</span>
+              <span data-phase="denoising">DENOISE <b id="denoiseSteps">0/3</b></span>
+              <span data-phase="decoding">VAE DECODE</span>
+              <span data-phase="chunk_done">PREVIEW</span>
+            </div>
+            <div class="progress-track"><i id="progressBar"></i></div>
+          </div>
+          <div class="segment-stream" id="segmentStream"></div>
+          <div class="revision-row">
+            <div class="revision-copy">
+              <span id="revisionLabel">尚未创建本地版本</span>
+              <small>选择一个 CHUNK，可从该段建立 v2v 新版本</small>
+            </div>
+            <div class="revision-actions">
+              <button id="retryChunkButton" type="button" disabled>从此段重做</button>
+            </div>
+          </div>
+          <details class="console">
+            <summary>运行日志 <span>LIVE CONSOLE</span></summary>
+            <pre id="jobLog">// EVOKE Director ready</pre>
+          </details>
+          <div class="advanced-row">
+            <label>SEED <input id="seed" type="number" value="42" min="0" max="2147483647" /></label>
+            <span>单 GPU · Post-distill</span>
+          </div>
+          <button class="generate-button" id="generateButton" type="button">
+            <span>开始流式生成</span>
+            <svg viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5" /></svg>
+          </button>
+          <button class="cancel-button" id="cancelButton" type="button" hidden>停止当前任务</button>
+          <p class="form-error" id="formError" role="alert"></p>
+        </aside>
+      </div>
+    </main>
+
+    <template id="promptTemplate">
+      <article class="prompt-card">
+        <div class="prompt-index">
+          <span>CHUNK</span><strong></strong><small></small>
+        </div>
+        <div class="prompt-copy">
+          <label></label>
+          <textarea rows="3" maxlength="4000"></textarea>
+          <div class="char-count">0 / 4000</div>
+        </div>
+        <button class="copy-previous" type="button" title="复制上一段" aria-label="复制上一段">
+          <svg viewBox="0 0 20 20"><path d="M7 6V4h9v9h-2M4 7h9v9H4V7Z" /></svg>
+        </button>
+      </article>
+    </template>
+    <script src="static/app.js?v=24" defer></script>
+  </body>
+</html>

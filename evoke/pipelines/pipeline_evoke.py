@@ -1686,6 +1686,21 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     xm.mark_step()
 
                 i += 1
+                _step_observer = getattr(self, "_evoke_progress_callback", None)
+                if callable(_step_observer):
+                    try:
+                        _step_observer(
+                            phase="denoising",
+                            chunks=int(getattr(self, "_evoke_progress_chunks", 1)),
+                            chunk_index=int(getattr(self, "_evoke_progress_chunk_index", 0)),
+                            stage=i_s + 1,
+                            step=i,
+                            total_steps=sum(stage2_num_inference_steps_list) * (
+                                2 if use_dmd and is_amplify_first_chunk else 1
+                            ),
+                        )
+                    except Exception:
+                        pass
 
         # Unfuse GEO LoRA at stage2 exit to prevent leaking into subsequent calls.
         if geo_lora_active:
@@ -2037,6 +2052,15 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
             print(f"[prompt-schedule] {len(_chunk_prompt_embeds)} switch point(s) at chunks "
                   f"{sorted(_chunk_prompt_embeds)}, {len(_uniq)} distinct prompt(s)", flush=True)
 
+        # The text encoder is not used again after all prompt variants have been embedded. The
+        # Director worker keeps the pipeline alive between jobs, so leaving it on CUDA needlessly
+        # competes with ViGeo + the VAE decoder at their peak. Opt-in: the regular inference path is
+        # unchanged. infer_single moves it back before the next call.
+        if bool(getattr(self, "_evoke_offload_text_encoder", False)):
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()
+            print("[geo-infer] text encoder offloaded after prompt encoding", flush=True)
+
         # 4. Prepare image latents.
         _v2v_decode_warm_latents = None
         if image is not None:
@@ -2364,11 +2388,27 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                               desc="chunks", unit="chunk", dynamic_ncols=True, file=_psys.stdout)
             _chunk_iter = _prog_bar
 
+        # Optional lightweight observer used by the Director UI. It receives metadata only (never
+        # tensors), so enabling it cannot retain GPU memory or alter sampling. Other callers leave the
+        # attribute unset and take the exact historical path.
+        _evoke_progress = getattr(self, "_evoke_progress_callback", None)
+
+        def _emit_progress(phase, **payload):
+            if callable(_evoke_progress):
+                try:
+                    _evoke_progress(phase=phase, chunks=num_latent_sections, **payload)
+                except Exception as _progress_error:
+                    if _prog_debug:
+                        print(f"[progress] observer failed: {_progress_error}", flush=True)
+
         for k in _chunk_iter:
+            self._evoke_progress_chunk_index = k
+            self._evoke_progress_chunks = num_latent_sections
             _t_chunk0 = _ptime.time()
             _t_warp_s = None      # None = phase did not run for this chunk (t2v, or warp disabled)
             _t_diff_s = None
             self._geo_last_render_stats = None   # else an event chunk reports the previous chunk's warp
+            _emit_progress("geometry", chunk_index=k, stage=0, step=0, total_steps=num_inference_steps)
             if use_interpolate_prompt:
                 assert num_latent_sections >= max(interpolate_cumulative_list)
 
@@ -2839,6 +2879,7 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 )
 
             _t_diff0 = _ptime.time()   # phase 2 of the chunk: the denoising steps themselves
+            _emit_progress("denoising", chunk_index=k, stage=0, step=0, total_steps=num_inference_steps)
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 if is_enable_stage2:
                     # Slice per-chunk c2ws using pixel-domain offset; stage2 recomputes plucker per stage.
@@ -2992,6 +3033,15 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     )
 
                 _t_diff_s = _ptime.time() - _t_diff0
+
+                _emit_progress(
+                    "decoding", chunk_index=k, stage=stage2_num_stages if is_enable_stage2 else 1,
+                    step=num_inference_steps, total_steps=num_inference_steps,
+                )
+                # Return fragmented denoiser workspace to CUDA before the VAE requests its largest
+                # contiguous activation. This is especially important on 48 GiB cards where the two
+                # phases otherwise miss each other by only a few dozen MiB.
+                torch.cuda.empty_cache()
 
                 if use_kv_cache:
                     self.transformer.clear_kv_cache()
@@ -3189,6 +3239,10 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     f"  |  decode+dump {_rest_s:6.2f}s"
                     f"  |  total {_t_total_s:6.2f}s",
                     file=_psys.stdout)
+            _emit_progress(
+                "chunk_done", chunk_index=k, stage=stage2_num_stages if is_enable_stage2 else 1,
+                step=num_inference_steps, total_steps=num_inference_steps,
+            )
 
         self._current_timestep = None
 

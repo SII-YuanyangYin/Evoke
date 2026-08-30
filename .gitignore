@@ -16,6 +16,7 @@
 *.ckpt
 *.pkl
 *.html
+!ui/static/index.html
 *.pdf
 !examples/logo/*.pdf
 *.whl
@@ -59,6 +60,9 @@ core.[0-9]*
 
 # Tool metadata
 .claude/
+
+# Local H200 UI development copy.
+/ui-h200/
 
 # Local working conventions (CLAUDE.md and friends): local only, never committed
 CLAUDE.md
