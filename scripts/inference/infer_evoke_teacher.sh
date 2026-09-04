@@ -12,6 +12,10 @@
 #   Memory: 2 x 14B is ~56 GB of bf16 weights. OFFLOAD=1 (the default) keeps only the routed
 #   expert resident. SINGLE_EXPERT=high|low loads one expert -- a plumbing check, not a valid sample.
 #
+#   Sparse attention: the currently shipped weights are cs9/select1. loader.py's cs8/select4 is a
+#   legacy fallback. These values do not alter parameter shapes, so checkpoint loading cannot catch
+#   a mismatch; always check the engine's "sparse EFFECTIVE" line when changing them.
+#
 #   Usage: [CLIP_SECONDS=5] [STEPS=50] [OUT=...] bash scripts/inference/infer_evoke_teacher.sh
 # ============================================================================
 set -e
@@ -40,6 +44,7 @@ Knobs   PROMPT  PROMPT_FILE  IMAGE        prompt text / file / i2v reference fra
         CLIP_SECONDS  NUM_FRAMES  FPS      output length
         STEPS  GUIDANCE_SCALE  SHIFT  SEED  sampler (GUIDANCE_SCALE=1.0 disables CFG)
         HEIGHT  WIDTH  BOUNDARY            resolution / expert switch (t >= BOUNDARY*1000 -> high)
+        CHUNK_SIZE (default 9)  NUM_SELECT_FRAMES (default 1)  sparse attention (shipped weights)
         OFFLOAD (default 1)  SINGLE_EXPERT  memory
         TEACHER_DIR  BASE  OUT  EVOKE_PYTHON_BIN
 Output  $OUT                                 generated mp4
@@ -58,6 +63,8 @@ STEPS=${STEPS:-50}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-5.0}
 SHIFT=${SHIFT:-5.0}
 BOUNDARY=${BOUNDARY:-0.9}
+CHUNK_SIZE=${CHUNK_SIZE:-9}
+NUM_SELECT_FRAMES=${NUM_SELECT_FRAMES:-1}
 SEED=${SEED:-42}
 OFFLOAD=${OFFLOAD:-1}
 OUT=${OUT:-"output/evoke_teacher/i2v.mp4"}
@@ -97,6 +104,7 @@ echo "[teacher] EXAMPLE ONLY -- not validated against the teacher's own sampler;
 echo "[teacher] mode=$MODE_NOTE"
 echo "[teacher] frames=$NUM_FRAMES (~$(awk "BEGIN{printf \"%.2f\", $NUM_FRAMES/$FPS}")s @${FPS}fps, latent T=$(( (NUM_FRAMES - 1) / 4 + 1 )))  ${HEIGHT}x${WIDTH}"
 echo "[teacher] steps=$STEPS shift=$SHIFT guidance_scale=$GUIDANCE_SCALE (CFG $CFG_STATE) boundary=$BOUNDARY seed=$SEED"
+echo "[teacher] sparse requested: chunk_size=$CHUNK_SIZE num_select_frames=$NUM_SELECT_FRAMES (shipped: cs9/select1)"
 echo "[teacher] offload=$OFFLOAD single_expert=${SINGLE_EXPERT:-none}"
 echo "[teacher] out=$OUT"
 echo "=============================================================================="
@@ -104,7 +112,8 @@ echo "==========================================================================
 ARGS=(--teacher_dir "$TEACHER_DIR" --base "$BASE" --prompt "$PROMPT"
       --height "$HEIGHT" --width "$WIDTH" --num_frames "$NUM_FRAMES" --fps "$FPS"
       --num_inference_steps "$STEPS" --shift "$SHIFT" --guidance_scale "$GUIDANCE_SCALE"
-      --boundary "$BOUNDARY" --seed "$SEED" --output "$OUT")
+      --boundary "$BOUNDARY" --chunk_size "$CHUNK_SIZE" --num_select_frames "$NUM_SELECT_FRAMES"
+      --seed "$SEED" --output "$OUT")
 [ -n "$IMAGE" ] && ARGS+=(--image_path "$IMAGE")
 [ "$OFFLOAD" = "1" ] && ARGS+=(--offload)
 [ -n "${SINGLE_EXPERT:-}" ] && ARGS+=(--single_expert "$SINGLE_EXPERT")

@@ -27,6 +27,15 @@ Scope, and why it is called an example:
     `--single_expert high|low` (routes every step to one expert -- wrong for half the schedule, fine to
     check the plumbing) or `--offload` to keep only the routed expert resident.
 
+Sparse-attention compatibility:
+
+  * The currently shipped EvokeTeacher weights were trained with `chunk_size=9` and
+    `num_select_frames=1` (cs9/select1). The cs8/select4 values in `loader.py` are fallback values for
+    an older configuration.
+  * These settings do not change parameter shapes, so loading a checkpoint cannot detect a mismatch.
+    Keep the effective-config log emitted after model construction in inference logs and check it when
+    using weights trained with a different sparse-attention configuration.
+
 Example:
 
     bash scripts/inference/infer_evoke_teacher.sh
@@ -62,6 +71,9 @@ NEGATIVE_PROMPT = (
     "extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, "
     "fused fingers, three legs, many people in the background, walking backwards, messy background"
 )
+
+SHIPPED_CHUNK_SIZE = 9
+SHIPPED_NUM_SELECT_FRAMES = 1
 
 
 def wan_sigmas(num_inference_steps: int, shift: float) -> torch.Tensor:
@@ -105,8 +117,7 @@ def encode_reference(vae, image_path, height, width, num_frames, device):
     return cond_latent_norm, latents_mean, latents_std
 
 
-@torch.no_grad()
-def main():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--teacher_dir", default="models/evoke/evoke_teacher",
                    help="parent of high_noise/ and low_noise/")
@@ -122,13 +133,54 @@ def main():
     p.add_argument("--guidance_scale", type=float, default=5.0, help="1.0 disables CFG")
     p.add_argument("--boundary", type=float, default=0.9,
                    help="expert switch: t >= boundary*1000 -> high-noise expert")
+    p.add_argument("--chunk_size", type=int, default=SHIPPED_CHUNK_SIZE,
+                   help="sparse-attention chunk size (shipped weights: 9; loader fallback 8 is legacy)")
+    p.add_argument("--num_select_frames", type=int, default=SHIPPED_NUM_SELECT_FRAMES,
+                   help="remote frames selected by sparse attention (shipped weights: 1; loader fallback 4 is legacy)")
     p.add_argument("--single_expert", choices=["high", "low"], default=None,
                    help="load one expert only; plumbing check, not a valid sample")
     p.add_argument("--offload", action="store_true", help="keep only the routed expert on GPU")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fps", type=int, default=24)
     p.add_argument("--output", default="output/evoke_teacher/i2v.mp4")
-    args = p.parse_args()
+    return p.parse_args(argv)
+
+
+def build_teacher_wrapper(args, device, dtype):
+    """Build the wrapper and report sparse settings from the constructed model itself."""
+    wrapper = EvokeTeacherScoreWrapper(
+        high_dir=os.path.join(args.teacher_dir, "high_noise"),
+        low_dir=os.path.join(args.teacher_dir, "low_noise"),
+        boundary=args.boundary,
+        model_cfg_overrides={
+            "chunk_size": args.chunk_size,
+            "num_select_frames": args.num_select_frames,
+        },
+        torch_dtype=dtype,
+        single_expert=args.single_expert,
+    ).to(device).eval()
+
+    # Read the values from a live block rather than echoing the CLI. Since chunk_size and
+    # num_select_frames do not affect parameter shapes, successful weight loading is not evidence
+    # that these construction-time settings match the checkpoint's training configuration.
+    expert = wrapper.dit_low if wrapper.dit_low is not None else wrapper.dit_high
+    block = expert.blocks[0]
+    print(
+        "[teacher] sparse EFFECTIVE: "
+        f"chunk_size={block.chunk_size} "
+        f"num_select_frames={block.num_select_frames} "
+        f"num_nearby_frames={block.num_nearby_frames} "
+        f"overlap_size={block.overlap_size} "
+        f"per_frame_tokens={block.per_frame_tokens} "
+        f"select_scales={list(block.select_scales)}",
+        flush=True,
+    )
+    return wrapper
+
+
+@torch.no_grad()
+def main():
+    args = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
@@ -154,13 +206,7 @@ def main():
     y = build_i2v_y(cond_latent_norm.to(dtype), num_cond_px_frames=num_cond_px)
 
     print(f"[teacher] building experts from {args.teacher_dir}", flush=True)
-    wrapper = EvokeTeacherScoreWrapper(
-        high_dir=os.path.join(args.teacher_dir, "high_noise"),
-        low_dir=os.path.join(args.teacher_dir, "low_noise"),
-        boundary=args.boundary,
-        torch_dtype=dtype,
-        single_expert=args.single_expert,
-    ).to(device).eval()
+    wrapper = build_teacher_wrapper(args, device, dtype)
     wrapper._per_expert_offload = bool(args.offload and args.single_expert is None)
     wrapper.set_condition(y)
 
